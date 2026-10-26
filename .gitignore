@@ -1,0 +1,19 @@
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+.venv/
+venv/
+
+# Secrets - never upload
+.streamlit/secrets.toml
+
+# Local database
+*.db
+*.sqlite
+*.sqlite3
+
+# Environment variables
+.env
