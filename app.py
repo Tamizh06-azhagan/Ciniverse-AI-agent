@@ -13,7 +13,7 @@ from pathlib import Path
 from contextlib import closing
 from datetime import datetime, date, timedelta
 from email.message import EmailMessage
-
+import database
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -573,6 +573,7 @@ def create_booking(customer, email, movie, location, theatre, show_date, showtim
 
 
 try:
+    database.init_db(DB_PATH)
     init_bookings_table()
     movies, all_showtimes, poster_db = load_data()
 except sqlite3.Error as e:
