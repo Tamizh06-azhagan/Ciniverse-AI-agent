@@ -9,9 +9,10 @@ import mimetypes
 import sqlite3
 import smtplib
 import textwrap
+from difflib import SequenceMatcher
 from pathlib import Path
 from contextlib import closing
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from email.message import EmailMessage
 import database
 import streamlit as st
@@ -30,6 +31,9 @@ SEATS_PER_SIDE = 3                         # 3 seats | aisle | 3 seats
 ALL_SEATS = [f"{r}{i}" for r in SEAT_ROWS for i in range(1, SEATS_PER_SIDE * 2 + 1)]
 DATE_WINDOW = 7                            # days ahead that can be booked
 MAX_CHAT_SEATS = 10
+
+# Indian Standard Time. Cloud servers run in UTC, so we always convert explicitly.
+IST = timezone(timedelta(hours=5, minutes=30))
 
 # Locations -> theatres. Edit / add freely.
 THEATRES = {
@@ -130,8 +134,13 @@ def sum_row(label, value):
     return f'<div class="sum-row"><span>{esc(label)}</span><span>{esc(value)}</span></div>'
 
 
+def now_ist():
+    """Current Indian time (naive datetime), independent of the server's timezone."""
+    return datetime.now(IST).replace(tzinfo=None)
+
+
 def today_date():
-    return datetime.now().date()
+    return now_ist().date()
 
 
 def date_options():
@@ -561,7 +570,7 @@ def create_booking(customer, email, movie, location, theatre, show_date, showtim
              booking_status, customer_email, booked_at, show_date, theatre, location)
             VALUES (?, ?, ?, ?, ?, ?, 'CONFIRMED', ?, ?, ?, ?, ?)
         """, (customer, movie, showtime, len(seats), ", ".join(seats), total_price,
-              (email or "").strip(), datetime.now().strftime("%d %b %Y, %I:%M %p"),
+              (email or "").strip(), now_ist().strftime("%d %b %Y, %I:%M %p"),
               show_date, theatre, location))
         conn.commit()
         return cursor.lastrowid, []
@@ -604,11 +613,11 @@ def _time_of(text):
 
 
 def available_times(movie, date_iso=None):
-    """Showtimes for a movie; on today's date, shows that already started are hidden."""
+    """Showtimes for a movie; on today's date, shows that already started are hidden (IST)."""
     times = times_for_movie(movie)
     if not date_iso or date.fromisoformat(date_iso) != today_date():
         return times
-    now = datetime.now().time()
+    now = now_ist().time()
     out = []
     for t in times:
         tt = _time_of(t)
@@ -622,9 +631,15 @@ def show_key(movie, theatre, show_date, showtime):
 
 
 # ==========================================
-# PARSING (used by the chat agent)
+# PARSING (used by the chat agent) - free-form, forgiving
 # ==========================================
 _TIME_RE = re.compile(r"\b(\d{1,2})(?:[:.](\d{2}))?\s*([ap])\.?m\b", re.I)
+_PLAIN_TIME_RE = re.compile(r"\b(\d{1,2})[:.]([0-5]\d)\b(?!\s*[ap]\.?m)", re.I)
+
+NUM_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+             "eight": 8, "nine": 9, "ten": 10, "onnu": 1, "rendu": 2, "moonu": 3,
+             "naalu": 4, "anju": 5}
+_NUM_PAT = r"\d{1,2}|" + "|".join(NUM_WORDS)
 
 
 def norm_time(text):
@@ -635,19 +650,59 @@ def norm_time(text):
     return f"{int(m.group(1))}:{int(m.group(2) or 0):02d}{m.group(3).lower()}m"
 
 
+def _times_in(message):
+    """(exact normalised times, loose (hour12, minute) pairs without am/pm)."""
+    exact, loose = set(), set()
+    for m in _TIME_RE.finditer(message):
+        n = norm_time(m.group(0))
+        if n:
+            exact.add(n)
+    for m in _PLAIN_TIME_RE.finditer(message):
+        h, mi = int(m.group(1)), int(m.group(2))
+        if h > 23:
+            continue
+        if h > 12 or h == 0:                       # 24-hour style, e.g. 14:00
+            exact.add(f"{h % 12 or 12}:{mi:02d}{'a' if h < 12 else 'p'}m")
+        else:                                      # "2:00" - am/pm not said
+            loose.add((h, mi))
+    return exact, loose
+
+
 def find_movie(message):
     low = message.lower()
     hits = [n for n in movie_names if re.search(rf"\b{re.escape(n.lower())}\b", low)]
-    return max(hits, key=len) if hits else None
+    if hits:
+        return max(hits, key=len)
+    # typo tolerance (e.g. "vikrm", "jailr")
+    words = re.findall(r"[a-z0-9]+", low)
+    best, best_ratio = None, 0.0
+    for n in movie_names:
+        nl = n.lower()
+        if len(nl) < 4:
+            continue
+        k = len(nl.split())
+        for i in range(len(words) - k + 1):
+            cand = " ".join(words[i:i + k])
+            if len(cand) < 4:
+                continue
+            r = SequenceMatcher(None, cand, nl).ratio()
+            if r > best_ratio:
+                best, best_ratio = n, r
+    return best if best_ratio >= 0.8 else None
 
 
 def find_showtime(movie, message):
-    if not movie:
-        return None
+    """Match a time in the message to a real showtime. Works even if the movie is
+    not in this message (movie=None -> any movie's showtimes)."""
     low = message.lower()
-    wanted = {norm_time(m.group(0)) for m in _TIME_RE.finditer(message)}
-    for t in times_for_movie(movie):
-        if str(t).lower() in low or norm_time(t) in wanted:
+    exact, loose = _times_in(message)
+    pool = (times_for_movie(movie) if movie
+            else list(dict.fromkeys(t for _, t in all_showtimes)))
+    for t in pool:
+        if str(t).lower() in low or norm_time(t) in exact:
+            return t
+        tt = _time_of(t)
+        if tt and ((tt.hour % 12 or 12), tt.minute) in loose:
             return t
     return None
 
@@ -658,7 +713,19 @@ def find_theatre(message):
         short = _slug(t.replace("CINEVERSE ", ""))
         if short and short in s:
             return t
-    return None
+    # fallback: distinguishing word only, e.g. "grand", "prime", "luxe", "mall", "max"
+    loc = find_location(message)
+    pool = THEATRES[loc] if loc else ALL_THEATRES
+    low_words = set(re.findall(r"[a-z]+", message.lower()))
+    cands = []
+    for t in pool:
+        short = t.replace("CINEVERSE ", "")
+        loc_words = set(re.findall(r"[a-z]+", THEATRE_LOCATION[t].lower()))
+        keys = {w for w in re.findall(r"[a-z]+", short.lower())
+                if w not in loc_words and len(w) >= 3}
+        if keys & low_words:
+            cands.append(t)
+    return cands[0] if len(cands) == 1 else None
 
 
 def find_location(message):
@@ -675,14 +742,31 @@ def find_date(message):
     today = today_date()
     window = date_options()
 
-    if re.search(r"\b(today|indru|inru|innaiku)\b", low):
+    if re.search(r"day after tomorrow|overmorrow|naalaiku maru ?naal", low):
+        return today + timedelta(days=2)
+    if re.search(r"\b(today|tonight|tonite|indru|inru|innaiku)\b", low):
         return today
-    if re.search(r"\b(tomorrow|naalaiku|naalaikku|naalai)\b", low):
+    if re.search(r"\b(tomorrow|tmrw|tomorow|naalaiku|naalaikku|naalai)\b", low):
         return today + timedelta(days=1)
     for d in window:
         for name in {d.strftime("%a").lower(), d.strftime("%A").lower()}:
             if re.search(rf"\b{name}\b", low):
                 return d
+
+    # 28/10, 28-10-2026
+    m = re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b", low)
+    if m:
+        day, mon = int(m.group(1)), int(m.group(2))
+        year = int(m.group(3)) if m.group(3) else None
+        if year is not None and year < 100:
+            year += 2000
+        try:
+            cand = date(year or today.year, mon, day)
+            if year is None and cand < today:
+                cand = date(today.year + 1, mon, day)
+        except ValueError:
+            return None
+        return cand if cand in window else None
 
     m = (re.search(r"\b(\d{1,2})(?:st|nd|rd|th)?\s*(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b", low)
          or re.search(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s*(\d{1,2})\b", low))
@@ -702,18 +786,62 @@ def find_date(message):
     return None
 
 
-def parse_booking_request(message):
+def find_seats(message):
+    """A1 A2 / a1,a2 / A1-A3 / A1 to A3 -> ['A1', 'A2', ...]"""
+    up = message.upper()
+    seats = []
+    range_re = re.compile(r"\b([A-D])([1-6])\s*(?:-|TO|TILL)\s*([A-D])?([1-6])\b")
+    for m in range_re.finditer(up):
+        r1, a, r2, b = m.groups()
+        if r2 and r2 != r1:
+            continue
+        lo, hi = sorted((int(a), int(b)))
+        seats += [f"{r1}{i}" for i in range(lo, hi + 1)]
+    rest = range_re.sub(" ", up)
+    seats += [f"{r}{n}" for r, n in re.findall(r"\b([A-D])-?([1-6])\b", rest)]
+    return list(dict.fromkeys(seats))
+
+
+def find_count(message):
+    """'2 tickets', 'two seats', 'for 3 people' -> int, else None."""
+    low = message.lower()
+    m = re.search(rf"\b({_NUM_PAT})\s*(?:tickets?|tkts?|seats?|persons?|people|members|pax)\b", low)
+    if not m:
+        m = re.search(rf"\bfor\s+({_NUM_PAT})\b(?!\s*(?:[ap]\.?m\b|[:.]\d))", low)
+    if not m:
+        return None
+    raw = m.group(1)
+    n = int(raw) if raw.isdigit() else NUM_WORDS.get(raw)
+    return n if n and 1 <= n <= MAX_CHAT_SEATS else None
+
+
+def auto_seats(booked, n):
+    """Best n free seats: a run together in one row if possible (middle rows first)."""
+    free = [s for s in ALL_SEATS if s not in booked]
+    if n > len(free):
+        return None
+    for r in ["B", "C", "A", "D"]:
+        if r not in SEAT_ROWS:
+            continue
+        nums = sorted(int(s[1:]) for s in free if s[0] == r)
+        for i in range(len(nums) - n + 1):
+            if nums[i + n - 1] - nums[i] == n - 1:
+                return [f"{r}{x}" for x in nums[i:i + n]]
+    return free[:n]
+
+
+def parse_booking_request(message, ctx_movie=None):
     movie = find_movie(message)
     theatre = find_theatre(message)
     location = None if theatre else find_location(message)
-    seats = list(dict.fromkeys(s.upper() for s in re.findall(r"\b([A-Da-d][1-6])\b", message)))
     return {
         "movie": movie,
         "theatre": theatre,
         "location": location,
         "date": find_date(message),
-        "showtime": find_showtime(movie, message),
-        "seats": seats,
+        "showtime": find_showtime(movie or ctx_movie, message),
+        "seats": find_seats(message),
+        "count": find_count(message),
     }
 
 
@@ -761,6 +889,9 @@ st.session_state.setdefault("selected_seats", [])
 st.session_state.setdefault("show_booking_confirmation", False)
 st.session_state.setdefault("selected_movie", movie_names[0])
 st.session_state.setdefault("selected_showtime", None)
+# Name box starts pre-filled with the Google account name, so the order can be reviewed
+# as soon as seats are chosen (no need to type and then click twice).
+st.session_state.setdefault("cust_name", google_name)
 
 if st.session_state["selected_movie"] not in movie_names:
     select_movie(movie_names[0])
@@ -1061,15 +1192,18 @@ else:
                 f'<div class="sum-total">{inr(total)}</div>',
                 unsafe_allow_html=True,
             )
+            # Never disabled: a disabled button swallows the first click (it only commits the
+            # name box). It turns red as soon as everything is filled in.
             review_clicked = st.button("Review order", key="review_btn",
-                                       use_container_width=True, type="primary",
-                                       disabled=not ready)
-            if not customer_name.strip():
-                st.caption("Enter your name to continue.")
-            elif missing_seats > 0:
-                st.caption(f"Select {missing_seats} more seat(s).")
+                                       use_container_width=True,
+                                       type="primary" if ready else "secondary")
+            if review_clicked and not ready:
+                if not customer_name.strip():
+                    st.warning("Please enter your name.")
+                else:
+                    st.warning(f"Please select {missing_seats} more seat(s).")
 
-        if review_clicked:
+        if review_clicked and ready:
             st.session_state["booking_details"] = current_details
             st.session_state["show_booking_confirmation"] = True
             st.session_state.pop("last_confirmation", None)
@@ -1145,6 +1279,9 @@ else:
 # ==========================================
 
 # ---------- Listing helpers ----------
+BOOK_HINT = "*Leo tomorrow 2 PM at Velachery Mall, 2 tickets*"
+
+
 def theatres_list_md(location=None):
     locs = [location] if location in THEATRES else LOCATIONS
     return "\n\n".join(f"**{loc}**\n" + "\n".join(f"- {t}" for t in THEATRES[loc]) for loc in locs)
@@ -1494,7 +1631,7 @@ def confirm_pending_booking():
         "showtime": p["showtime"],
         "seats": seats,
         "total": p["total_price"],
-        "booked_at": datetime.now().strftime("%d %b %Y, %I:%M %p"),
+        "booked_at": now_ist().strftime("%d %b %Y, %I:%M %p"),
         "png": None,
     }
     ticket["png"] = get_ticket_png(ticket)
@@ -1531,14 +1668,16 @@ def route_ai_tool(user_message):
         return {"tool": "list_theatres", "result": location}
     if re.search(r"\b(dates?|which day|what day)\b", message):
         return {"tool": "list_dates", "result": None}
-    if "movie" in message and any(w in message for w in ["available", "list", "show me", "all"]):
+    if "movie" in message and any(w in message for w in ["available", "list", "show me", "all", "running", "playing"]):
         return {"tool": "search_movies", "result": None}
     if any(w in message for w in ["compare", "cheapest", "cheap", "lowest price"]):
         return {"tool": "compare_prices", "result": None}
     if "showtime" in message or "show time" in message or "timing" in message:
         return {"tool": "search_showtimes", "result": {"movie": movie_name, "date": date_obj}}
     if "how much" in message or "total" in message or "tickets" in message:
-        ticket_count = next((int(w) for w in message.split() if w.isdigit()), None)
+        ticket_count = find_count(message)
+        if ticket_count is None:
+            ticket_count = next((int(w) for w in message.split() if w.isdigit()), None)
         if movie_name and ticket_count is not None:
             return {"tool": "calculate_booking_total",
                     "result": {"movie": movie_name, "count": ticket_count}}
@@ -1552,7 +1691,7 @@ def format_agent_response(resp):
 
     if tool == "list_theatres":
         return ("**CINEVERSE theatres**\n\n" + theatres_list_md(result)
-                + "\n\nTo book, type: *Book Leo at CINEVERSE Velachery Mall, tomorrow, 2:00 PM, A1 and A2*")
+                + f"\n\nTo book, just tell me what you want, e.g. {BOOK_HINT}")
 
     if tool == "list_dates":
         return "**Dates you can book (next 7 days)**\n\n" + dates_list_md()
@@ -1560,7 +1699,7 @@ def format_agent_response(resp):
     if tool == "search_movies":
         lines = ["**Movies currently showing**\n"]
         lines += [f"- **{m[0]}**: {m[1]}, {inr(m[2])} per ticket" for m in movies]
-        lines.append("\nTo book, type: *Book Leo at CINEVERSE Anna Nagar Grand, tomorrow, 2:00 PM, A1 and A2*")
+        lines.append(f"\nTo book, just tell me what you want, e.g. {BOOK_HINT}")
         return "\n".join(lines)
 
     if tool == "compare_prices":
@@ -1590,7 +1729,7 @@ def format_agent_response(resp):
                 f"Tickets: {result['count']}\n\n"
                 f"Price per ticket: {inr(price)}\n\n"
                 f"**Total: {inr(total)}**\n\n"
-                "Want me to book it? Tell me the theatre, date, showtime and seats.")
+                "Want me to book it? Just tell me the theatre, date and showtime.")
 
     if tool == "get_ticket_price":
         return (f"**{result}**: {inr(price_by_movie[result])} per ticket\n\n"
@@ -1599,39 +1738,82 @@ def format_agent_response(resp):
     return ""
 
 
-# ---------- Booking conversation (multi-step) ----------
-YES_WORDS = {"yes", "y", "ok", "okay", "confirm", "confirmed", "sure", "yep", "aama", "sari", "seri"}
-NO_WORDS = {"no", "n", "cancel", "nope", "venam", "vendam"}
+# ---------- Booking conversation (multi-step, free-form) ----------
+YES_WORDS = {"yes", "y", "ya", "yeah", "yup", "yep", "ok", "okay", "k", "confirm", "confirmed",
+             "sure", "proceed", "done", "fine", "aama", "aamam", "sari", "seri"}
+NO_WORDS = {"no", "n", "nope", "cancel", "stop", "venam", "vendam", "vena"}
 EMPTY_DRAFT = {"movie": None, "location": None, "theatre": None,
-               "date": None, "showtime": None, "seats": []}
+               "date": None, "showtime": None, "seats": [], "count": None}
+
+EXPLICIT_BOOK = re.compile(r"\b(book|booking|reserve|buy|purchase|pannu|pannunga|panni|pannidu|venum|vennum)\b")
+WEAK_BOOK = re.compile(r"\b(i|we)\s+(want|need|would like)\b|\bi'd like\b|\bget me\b|"
+                       r"\bwant to (watch|see)\b|\bwatch\b|\btickets?\b|\bseats?\b")
+INFO_STRONG = re.compile(r"\b(price|prices|cost|cheap|cheapest|compare|showtimes?|show times?|"
+                         r"timings?|how much|list)\b|\?")
+INFO_LIST = re.compile(r"\b(theatres?|theaters?|cinemas?|venues?|locations?|dates?)\b")
 
 
 def handle_booking_message(prompt):
-    """Returns a reply if this message belongs to a booking flow, else None."""
+    """Understands booking requests written in any style, remembers what is already known
+    and asks only for what is missing. Returns a reply if this message belongs to a
+    booking flow, else None."""
     low = prompt.lower().strip()
     pending = st.session_state.get("pending_booking")
     draft = st.session_state.get("booking_draft")
 
+    ctx_movie = pending["movie_name"] if pending else (draft or {}).get("movie")
+    p = parse_booking_request(prompt, ctx_movie)
+    words = re.findall(r"[a-z0-9]+", low)
+    wordset = set(words)
+
+    core_info = any([p["movie"], p["theatre"], p["date"], p["showtime"], p["seats"]])
+    explicit = bool(EXPLICIT_BOOK.search(low))
+    weak = bool(WEAK_BOOK.search(low))
+    is_info_q = (bool(INFO_STRONG.search(low))
+                 or bool(INFO_LIST.search(low) and not core_info and not p["location"]))
+
+    # ----- a booking is waiting for confirmation -----
     if pending:
-        word = re.sub(r"[^a-z ]", "", low).strip()
-        if word in YES_WORDS:
-            confirm_pending_booking()
-            return ""
-        if word in NO_WORDS:
+        if len(words) <= 6 and not core_info and not p["count"]:
+            if wordset & YES_WORDS and not wordset & NO_WORDS:
+                confirm_pending_booking()
+                return ""
+            if wordset & NO_WORDS:
+                cancel_pending_booking()
+                return ""
+        if re.search(r"\bcancel\b", low):
             cancel_pending_booking()
             return ""
+        if (core_info or p["count"]) and (explicit or not is_info_q):
+            # the user wants to change something -> reopen the booking as a draft
+            draft = {
+                "movie": pending["movie_name"], "location": pending["location"],
+                "theatre": pending["theatre"], "date": pending["show_date"],
+                "showtime": pending["showtime"], "seats": list(pending["seats"]), "count": None,
+            }
+            st.session_state.pop("pending_booking", None)
+        else:
+            return None
 
     if draft and re.search(r"\bcancel\b", low):
         st.session_state.pop("booking_draft", None)
         return "Okay, I have dropped that booking request."
 
-    wants_booking = bool(re.search(r"\b(book|reserve|booking)\b", low))
-    p = parse_booking_request(prompt)
-    has_info = any([p["movie"], p["theatre"], p["location"], p["date"], p["showtime"], p["seats"]])
-    if not (wants_booking or (draft and has_info)):
+    # a bare number while we are waiting for seats = number of tickets
+    if draft and draft.get("showtime") and not draft.get("seats") and not p["count"]:
+        m = re.fullmatch(r"\s*(\d{1,2})\s*", low)
+        if m and 1 <= int(m.group(1)) <= MAX_CHAT_SEATS:
+            p["count"] = int(m.group(1))
+
+    n_fields = sum(bool(x) for x in [p["movie"], p["theatre"] or p["location"], p["date"],
+                                     p["showtime"], p["seats"] or p["count"]])
+    starts = explicit or (weak and not is_info_q) or (n_fields >= 3 and not is_info_q)
+    continues = (bool(draft) and (explicit or not is_info_q)
+                 and bool(core_info or p["location"] or p["count"]))
+    if not (starts or continues):
         return None
 
-    d = dict(draft or EMPTY_DRAFT)
+    d = dict(EMPTY_DRAFT, **(draft or {}))
     d["seats"] = list(d["seats"])
 
     if p["movie"] and p["movie"] != d["movie"]:
@@ -1645,14 +1827,17 @@ def handle_booking_message(prompt):
     if p["showtime"]:
         d["showtime"] = p["showtime"]
     if p["seats"]:
-        d["seats"] = p["seats"]
+        d["seats"], d["count"] = p["seats"], None
+    elif p["count"]:
+        d["count"], d["seats"] = p["count"], []     # new count -> pick seats again
 
     def save(reply):
         st.session_state["booking_draft"] = d
         return reply
 
     if not d["movie"]:
-        return save("Sure! Which movie would you like to book?")
+        return save("Sure! Which movie would you like to book?\n\n"
+                    + "\n".join(f"- {m}" for m in movie_names))
 
     if not d["theatre"]:
         if d["location"]:
@@ -1676,15 +1861,30 @@ def handle_booking_message(prompt):
                     + "\n".join(f"- {t}" for t in times))
 
     booked = fetch_booked_seats(d["movie"], d["date"], d["theatre"], d["showtime"])
+    free = [s for s in ALL_SEATS if s not in booked]
+    auto_note = ""
+
     if not d["seats"]:
-        free = [s for s in ALL_SEATS if s not in booked]
-        return save(f"Which seats for **{d['movie']}** at **{d['showtime']}**?\n\n"
-                    f"Available: {', '.join(free) if free else 'none, sold out'}")
+        n = d.get("count")
+        if not n:
+            return save(f"Which seats for **{d['movie']}** at **{d['showtime']}**?\n\n"
+                        f"Available: {', '.join(free) if free else 'none, sold out'}\n\n"
+                        "Tell me the seat numbers (e.g. A1, A2), or just say how many tickets "
+                        "(e.g. *2 tickets*) and I will pick the best seats.")
+        if n > MAX_CHAT_SEATS:
+            d["count"] = None
+            return save(f"You can book up to {MAX_CHAT_SEATS} seats at a time. Please choose fewer.")
+        if n > len(free):
+            d["count"] = None
+            return save(f"Only {len(free)} seat(s) are left for this show"
+                        + (f": {', '.join(free)}." if free else ", it is sold out."))
+        d["seats"], d["count"] = auto_seats(booked, n), None
+        auto_note = ("\n\n*I picked the best available seats. "
+                     "Type other seats (e.g. A1, A2) if you want to change them.*")
 
     bad = [s for s in d["seats"] if s in booked or s not in ALL_SEATS]
     if bad:
         d["seats"] = []
-        free = [s for s in ALL_SEATS if s not in booked]
         return save(f"Seat(s) **{', '.join(bad)}** are not available.\n\n"
                     f"Available: {', '.join(free) if free else 'none, sold out'}\n\n"
                     "Please pick other seats.")
@@ -1696,6 +1896,7 @@ def handle_booking_message(prompt):
     if price is None:
         return save("Sorry, I could not find the ticket price for that movie.")
 
+    d["seats"] = sorted(d["seats"])
     total = float(price) * len(d["seats"])
     st.session_state["pending_booking"] = {
         "movie_name": d["movie"], "location": d["location"], "theatre": d["theatre"],
@@ -1713,13 +1914,35 @@ def handle_booking_message(prompt):
         f"Tickets: {len(d['seats'])}\n\n"
         f"Total: **{inr(total)}**\n\n"
         f"Name: {google_name}\n\n"
-        "Press **Confirm Booking** below (or type *yes*), or **Cancel**."
+        "Press **Confirm Booking** below (or type *yes*), **Cancel**, "
+        "or tell me what to change (e.g. *make it 5 PM*)." + auto_note
     )
 
 
-# ---------- LLM fallback (Ollama) ----------
+# ---------- Small talk + LLM fallback (Ollama) ----------
+HELP_TEXT = ("I can show movies, prices, theatres, dates and showtimes, and book tickets for you. "
+             f"Just tell me what you want in your own words, e.g. {BOOK_HINT}")
+
+
+def smalltalk(prompt):
+    low = prompt.lower().strip()
+    words = set(re.findall(r"[a-z]+", low))
+    if words & {"hi", "hii", "hello", "hey", "hai", "vanakkam", "yo"} and len(words) <= 4:
+        return "Hi! " + HELP_TEXT
+    if words & {"thanks", "thank", "thx", "tq", "nandri"} and len(words) <= 5:
+        return "You're welcome! Anything else I can help with?"
+    if words & {"help", "options"} and len(words) <= 6:
+        return HELP_TEXT
+    return None
+
+
 def cineverse_reply(user_message):
-    import requests
+    fallback = ("I did not quite get that. You can ask about movies, prices, theatres, dates and "
+                f"showtimes, or tell me what to book, e.g. {BOOK_HINT}")
+    try:
+        import requests
+    except ImportError:
+        return fallback
 
     movie_catalogue = "\n".join(f"- {n}: Language={l}, Ticket price=Rs.{p}" for n, l, p in movies)
     showtime_catalogue = "\n".join(f"- {m}: {t}" for m, t in all_showtimes)
@@ -1731,8 +1954,8 @@ def cineverse_reply(user_message):
                 "Answer clearly and briefly. Use only the supplied catalogue for facts. "
                 "Never invent movies, prices, showtimes, theatres, seat availability or bookings. "
                 "If information is missing, say you do not know. Never claim a booking was made. "
-                "To book, the user should type for example: "
-                "'Book Leo at CINEVERSE Anna Nagar Grand, tomorrow, 2:00 PM, A1 and A2'."
+                "To book, the user can just say what they want in their own words, for example: "
+                "'Book Leo tomorrow 2 PM at Velachery Mall, 2 tickets'."
                 "\n\nMOVIE CATALOGUE:\n" + movie_catalogue
                 + "\n\nSHOWTIMES (same at every theatre, for the next 7 days):\n" + showtime_catalogue
                 + "\n\nTHEATRES BY LOCATION:\n" + theatre_catalogue)},
@@ -1746,16 +1969,19 @@ def cineverse_reply(user_message):
         response.raise_for_status()
         return response.json()["message"]["content"]
     except requests.RequestException:
-        return ("I am unable to connect to the local AI model right now. "
-                "Please check that Ollama is running and try again.")
+        return fallback
     except (KeyError, ValueError):
-        return "I am having trouble answering that. Please try again."
+        return fallback
 
 
 # ---------- Chat entry point ----------
 WELCOME = {"role": "assistant",
            "content": "Hi! I can show movies, prices, theatres, dates and showtimes, and **book tickets for you**.\n\n"
-                      "Try: *Book Leo at CINEVERSE Anna Nagar Grand, tomorrow, 2:00 PM, A1 and A2*"}
+                      "Just tell me what you want in your own words, for example:\n\n"
+                      "- *Book Leo tomorrow 2 PM at Velachery Mall, 2 tickets*\n"
+                      "- *Leo sunday 2pm Anna Nagar Grand A1 A2*\n"
+                      "- *I want to watch Leo*\n\n"
+                      "I will ask for anything that is missing."}
 st.session_state.setdefault("cineverse_chat_history", [WELCOME])
 
 
@@ -1769,7 +1995,10 @@ def ask_concierge(prompt):
     reply = handle_booking_message(prompt)
     if reply is None:
         resp = route_ai_tool(prompt)
-        reply = format_agent_response(resp) if resp["tool"] else cineverse_reply(prompt)
+        if resp["tool"]:
+            reply = format_agent_response(resp)
+        else:
+            reply = smalltalk(prompt) or cineverse_reply(prompt)
 
     if reply:
         hist.append({"role": "assistant", "content": reply})
@@ -1826,7 +2055,7 @@ st.write("")
 with st.container(key="concierge"):
     st.markdown('<div class="sec-title">Ask the Concierge</div>'
                 '<div class="sec-sub">Ask about movies, theatres, dates, prices and showtimes, '
-                'or tell me what to book.</div>',
+                'or tell me what to book in your own words.</div>',
                 unsafe_allow_html=True)
 
     quick = [("All movies", "Show me all movies"),
@@ -1863,7 +2092,7 @@ with st.container(key="concierge"):
         f1, f2 = st.columns([5, 1])
         with f1:
             st.text_input("Message",
-                          placeholder="e.g. Book Leo at Anna Nagar Grand, tomorrow, 2:00 PM, A1 and A2",
+                          placeholder="e.g. Book Leo tomorrow 2 PM at Velachery Mall, 2 tickets",
                           label_visibility="collapsed", key="cv_chat_text")
         with f2:
             st.form_submit_button("Ask", use_container_width=True,
